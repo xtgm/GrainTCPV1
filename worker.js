@@ -41,7 +41,7 @@ const P_S5 = 'so'+'cks5';
 let ECH = true;  // ECH 开关 (支持环境变量覆盖)
 let ECH_DNS = 'https://odvr.nic.cz/doh';
 let ECH_SNI = 'cloudflare-ech.com';
-let FP = ECH ? 'firefox' : 'randomized';
+let FP = ECH ? 'chrome' : 'randomized';
 
 // ECH Config 动态获取 (二进制 DoH wire format)
 async function _getECH() {
@@ -166,7 +166,7 @@ async function pCL(text, uuid, h) {
         while(bc>0&&i+1<L.length){i++;fn+='\n'+L[i];bc+=(L[i].match(/\{/g)||[]).length-(L[i].match(/\}/g)||[]).length;}
         const um=fn.match(/uuid:\s*([^,}\n]+)/);
         if(um&&um[1].trim()===uuid.trim()){
-          fn=fn.replace(/client-fingerprint:\s*[^,}\s]+/,'client-fingerprint: firefox');
+          fn=fn.replace(/client-fingerprint:\s*[^,}\s]+/,'client-fingerprint: '+FP);
           fn=fn.replace(/\}(\s*)$/,`, ${_eo}: {enable: true, ${_qsn}: ${ECH_SNI}${_echB64 ? ', config: ' + _echB64 : ''}}}$1`);
         }
         R.push(fn);i++;
@@ -179,7 +179,7 @@ async function pCL(text, uuid, h) {
           nl.push(nx);i++;}
         const um=nl.join('\n').match(/uuid:\s*([^\n]+)/);
         if(um&&um[1].trim()===uuid.trim()){
-          for(let j=0;j<nl.length;j++){if(/client-fingerprint:/.test(nl[j])){nl[j]=nl[j].replace(/client-fingerprint:\s*\S+/,'client-fingerprint: firefox');break;}}
+          for(let j=0;j<nl.length;j++){if(/client-fingerprint:/.test(nl[j])){nl[j]=nl[j].replace(/client-fingerprint:\s*\S+/,'client-fingerprint: '+FP);break;}}
           let ii=-1;for(let j=nl.length-1;j>=0;j--)if(nl[j].trim()){ii=j;break;}
           if(ii>=0){const ind=' '.repeat(bi+2);const echLines=[ind+_eo+':',ind+'  enable: true',ind+'  '+_qsn+': '+ECH_SNI];if(_echB64){echLines.push(ind+'  config: '+_echB64);}nl.splice(ii+1,0,...echLines);}}
         R.push(...nl);
@@ -191,7 +191,7 @@ async function pCL(text, uuid, h) {
 // =============================================================================
 // 🧠 GrainTCP 代理内核
 // =============================================================================
-const CFG = { id: '2523c510-9ff0-415b-9582-93949bfae7e3', chunk: 64 * 1024, dnPack: 32 * 1024, dnTail: 512, dnMs: 0, upPack: 16 * 1024, upQMax: 256 * 1024, maxED: 8 * 1024, concur: 4, autoConcur: true };
+const CFG = { id: '2523c510-9ff0-415b-9582-93949bfae7e3', chunk: 64 * 1024, dnPack: 32 * 1024, dnTail: 512, dnQr: 4, upPack: 20 * 1024, maxED: 8 * 1024, concur: 4, autoConcur: true };
 
 /* ---------- 部署环境自动识别 ----------
  * Snippets:   fetch(request)         → env === undefined → concur 强制 1
@@ -630,73 +630,67 @@ const tryCon = async (fetcher, addrType, host, port, routeCfg) => {
   throw lastErr || new Error('All methods failed');
 };
 
-/* ---------- 上行队列（GrainTCP 原生） ---------- */
-const mkQ = (cap, qCap = cap, itemsMax = Math.max(1, qCap >> 8)) => {
-  let q = [], h = 0, qB = 0, buf = null;
+/* ---------- 队列核（GrainTCP 新版，上行/下行复用，无背压） ---------- */
+const mkK = (cap, cpy = 0) => {
+  let q = [], h = 0, b = 0, buf = null;
+  const e = () => h >= q.length;
   const trim = () => { h > 32 && h * 2 >= q.length && (q = q.slice(h), h = 0); };
-  const take = () => { if (h >= q.length) return null; const d = q[h]; q[h++] = undefined; qB -= d.byteLength; trim(); return d; };
+  const clear = () => { q = []; h = 0; b = 0; };
+  const take = () => { if (e()) return null; const d = q[h]; q[h++] = undefined; b -= d.byteLength; trim(); return d; };
+  const sow = d => { const n = d?.byteLength || 0; return !n || (q.push(d), b += n, 1); };
+  const pack = d => {
+    d ||= take();
+    if (!d || e()) return [d, 0];
+    let n = d.byteLength, j = h;
+    while (j < q.length) { const x = q[j], nn = n + x.byteLength; if (nn > cap) break; n = nn; j++; }
+    if (j === h) return [d, 0];
+    const out = buf ||= new Uint8Array(cap);
+    out.set(d);
+    for (let o = d.byteLength; h < j;) { const x = q[h]; q[h++] = undefined; b -= x.byteLength; out.set(x, o); o += x.byteLength; }
+    trim();
+    const u = out.subarray(0, n);
+    return [cpy ? u.slice() : u, 1];
+  };
+  return { e, get b() { return b; }, clear, take, sow, pack };
+};
+
+/* ---------- 上行队列（GrainTCP 新版，无背压） ---------- */
+const mkQ = cap => {
+  const k = mkK(cap);
   return {
-    get bytes() { return qB; },
-    get size() { return q.length - h; },
-    get empty() { return h >= q.length; },
-    clear() { q = []; h = 0; qB = 0; },
-    sow(d) {
-      const n = d?.byteLength || 0;
-      if (!n) return 1;
-      if (qB + n > qCap || q.length - h >= itemsMax) return 0;
-      q.push(d); qB += n; return 1;
-    },
-    bundle(d) {
-      d ||= take();
-      if (!d || h >= q.length || d.byteLength >= cap) return [d, 0];
-      let n = d.byteLength, e = h;
-      while (e < q.length) { const x = q[e], nn = n + x.byteLength; if (nn > cap) break; n = nn; e++; }
-      if (e === h) return [d, 0];
-      const out = buf ||= new Uint8Array(cap);
-      out.set(d);
-      for (let o = d.byteLength; h < e;) { const x = q[h]; q[h++] = undefined; qB -= x.byteLength; out.set(x, o); o += x.byteLength; }
-      trim();
-      return [out.subarray(0, n), 1];
-    }
+    get empty() { return k.e(); },
+    clear: k.clear,
+    sow: k.sow,
+    bundle: d => k.pack(d)
   };
 };
 
-/* ---------- 下行 microtask 打包器（GrainTCP 原生） ---------- */
+/* ---------- 下行打包器（GrainTCP 新版：复用 mkK，zero-copy 入队） ---------- */
 const mkDn = w => {
-  const cap = CFG.dnPack, tail = CFG.dnTail, low = Math.max(4096, tail << 3);
-  let pb = new Uint8Array(cap), p = 0, tp = 0, mq = 0, gen = 0, qk = 0, qr = 0;
-  const reap = () => { tp && clearTimeout(tp); tp = 0; mq = 0; if (!p) return; w.send(pb.subarray(0, p).slice()); pb = new Uint8Array(cap); p = 0; qr = 0; };
+  const cap = CFG.dnPack, tail = CFG.dnTail, low = Math.max(4096, tail * 12), k = mkK(cap, 1);
+  let tp = 0, gen = 0, qk = 0, qr = 0;
+  const reap = () => { tp && clearTimeout(tp); tp = 0; qr = 0; for (;;) { const [u] = k.pack(); if (!u) break; w.send(u); } };
   const ripen = () => {
-    if (tp || mq) return;
-    mq = 1; qk = gen;
-    queueMicrotask(() => {
-      mq = 0;
-      if (!p || tp) return;
-      if (cap - p < tail) return reap();
-      tp = setTimeout(() => {
-        tp = 0;
-        if (!p) return;
-        if (cap - p < tail) return reap();
-        if (qr < 2 && (gen !== qk || p < low)) { qr++; qk = gen; return ripen(); }
-        reap();
-      }, Math.max(CFG.dnMs, 1));
-    });
+    if (k.e() || tp) return;
+    if (k.b >= cap || cap - k.b < tail) return reap();
+    tp = setTimeout(() => {
+      tp = 0;
+      if (k.e()) return;
+      if (k.b >= cap || cap - k.b < tail) return reap();
+      if (qr < CFG.dnQr && (gen !== qk || k.b < low)) { qr++; qk = gen; return ripen(); }
+      reap();
+    }, 1);
   };
   return {
     send(u) {
       let o = 0, n = u?.byteLength || 0;
       if (!n) return;
       while (o < n) {
-        if (!p && n - o >= cap) {
-          const m = Math.min(cap, n - o);
-          w.send(o || m !== n ? u.subarray(o, o + m) : u);
-          o += m;
-          continue;
-        }
-        const m = Math.min(cap - p, n - o);
-        pb.set(u.subarray(o, o + m), p);
-        p += m; o += m; gen++;
-        if (p === cap || cap - p < tail) reap();
+        const m = Math.min(cap - k.b, n - o);
+        if (!m) { reap(); continue; }
+        k.sow(o || m !== n ? u.subarray(o, o + m) : u);
+        gen++; o += m;
+        if (k.b >= cap || cap - k.b < tail) reap();
         else ripen();
       }
     },
@@ -778,7 +772,7 @@ const ws = async req => {
   }
 
   let curW = null, sock = null, closed = false, busy = false;
-  const uq = mkQ(CFG.upPack, CFG.upQMax, CFG.upQMax >> 8);
+  const uq = mkQ(CFG.upPack);
 
   const wither = () => {
     if (closed) return;
@@ -827,7 +821,7 @@ const ws = async req => {
     } catch { wither(); }
     finally {
       busy = false;
-      !uq.empty && !closed && queueMicrotask(thresh);
+      !uq.empty && !closed && thresh();
     }
   };
 
@@ -1184,7 +1178,7 @@ export default {
       ECH = _echFlag === 'true';
       ECH_SNI = await getSafeEnv(env, 'ECH_SNI', ECH_SNI);
       ECH_DNS = await getSafeEnv(env, 'ECH_DNS', ECH_DNS);
-      FP = ECH ? 'firefox' : 'randomized';
+      FP = ECH ? 'chrome' : 'randomized';
 
       // 👇 变量去重与统一调用逻辑：优先 getSafeEnv(环境变量, 默认常量)
       const _TG_GROUP_URL = await getSafeEnv(env, 'TG_GROUP_URL', TG_GROUP_URL);
@@ -1353,12 +1347,29 @@ export default {
             }
 
             if (success) {
-                try {
-                  let decoded = atob(body);
-                  let lines = decoded.split('\n').map(line => {
+                const _b64Text = text => btoa(unescape(encodeURIComponent(text)));
+                const _decodeNativeSub = text => {
+                  const raw = (text || '').trim();
+                  if (!raw) return null;
+                  if (raw.includes('://')) return raw;
+                  try {
+                    const compact = raw.replace(/\s+/g, '').replace(/-/g, '+').replace(/_/g, '/');
+                    const padded = compact + '='.repeat((4 - compact.length % 4) % 4);
+                    const bin = atob(padded);
+                    try {
+                      const utf8 = decodeURIComponent(escape(bin));
+                      return utf8.includes('://') ? utf8 : null;
+                    } catch(e) {
+                      return bin.includes('://') ? bin : null;
+                    }
+                  } catch(e) { return null; }
+                };
+                const decoded = _decodeNativeSub(body);
+                if (decoded) {
+                  let lines = decoded.split(/\r?\n/).map(line => {
                     line = line.trim();
                     if (!line || !line.includes('://')) return line;
-                    // ECH URI 注入（v2rayN/Shadowrocket 支持）
+                    // ECH URI 注入（v2rayN/Shadowrocket/Happ 支持）
                     const _echURI = UA_L.includes('v2'+'ray') || UA_L.includes('sha'+'dow'+'roc'+'ket') || UA_L.includes('ha'+'pp');
                     if (ECH && _echURI && !line.includes('&ech=')) {
                       const echVal = encodeURIComponent((ECH_SNI ? ECH_SNI + '+' : '') + ECH_DNS);
@@ -1370,7 +1381,7 @@ export default {
                       }
                     }
                     // FP 修正
-                    if (ECH && _echURI && line.includes('fp=')) {
+                    if (_echURI && line.includes('fp=')) {
                       line = line.replace(/fp=[^&#]+/, 'fp=' + FP);
                     }
                     // PS 后缀
@@ -1380,20 +1391,18 @@ export default {
                     }
                     return line;
                   });
-                  // 浏览器不 base64（方便调试），代理客户端 base64
-                  const isBrowser = UA_L.includes('mozilla') && !UA_L.includes('v2'+'ray') && !UA_L.includes('sha'+'dow'+'roc'+'ket') && !UA_L.includes('ha'+'pp');
-                  body = isBrowser ? lines.join('\n') : btoa(lines.join('\n'));
-                } catch(e) {}
-                _subHeaders['Content-Type'] = 'text/plain; charset=utf-8';
-                return new Response(body, { status: 200, headers: _subHeaders });
+                  // 自适应订阅固定返回 UTF-8 安全 base64，禁止浏览器/客户端拿到明文节点。
+                  body = _b64Text(lines.join('\n'));
+                  _subHeaders['Content-Type'] = 'text/plain; charset=utf-8';
+                  return new Response(body, { status: 200, headers: _subHeaders });
+                }
             }
           } catch(e) {}
 
           // ===== 兜底：本地生成 =====
           const allIPs = await getCustomIPs(env, _DLS);
           const listText = genNodes(host, _UUID, requestProxyIp, allIPs, _PS);
-          const isBrowserFallback = UA_L.includes('mozilla') && !UA_L.includes('v2'+'ray') && !UA_L.includes('sha'+'dow'+'roc'+'ket') && !UA_L.includes('ha'+'pp');
-          const fallbackBody = isBrowserFallback ? listText : btoa(unescape(encodeURIComponent(listText)));
+          const fallbackBody = btoa(unescape(encodeURIComponent(listText)));
           _subHeaders['Content-Type'] = 'text/plain; charset=utf-8';
           return new Response(fallbackBody, { status: 200, headers: _subHeaders });
       }
@@ -3477,7 +3486,6 @@ function dashPage(host, uuid, proxyip, subpass, subdomain, converter, env, clien
                     <div class="network-info-tip">💡 <b>国内测试</b> 由分流规则决定，<b>国外测试</b> 由优选IP决定，<b>CF、墙外入口、ChatGPT</b> 由 PROXYIP 决定</div>
                     <div class="card-title" style="margin-top:25px;padding-top:20px;border-top:1px solid var(--border)"><span class="icon">⚡</span> 延迟测试</div>
                     <div class="latency-cards-grid" id="latency-cards"></div>
-                    <div class="network-info-tip">💡 更多测试项目，可前往 <a href="https://ip.skk.moe/" target="_blank" rel="noopener">ip.skk.moe</a> 自行测试</div>
                 </div>
             </div>
 
@@ -3523,8 +3531,8 @@ function dashPage(host, uuid, proxyip, subpass, subdomain, converter, env, clien
                             </div>
                             <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
                                 <span style="font-size:0.8rem;color:var(--text-dim)">指纹 (FP):</span>
-                                <span id="fpDisplay" style="font-size:0.8rem;color:var(--glass-green);font-weight:600">${echEnabled === 'true' ? 'firefox' : 'randomized'}</span>
-                                <span style="font-size:0.75rem;color:var(--text-dim)">(ECH开→firefox, 关→randomized)</span>
+                                <span id="fpDisplay" style="font-size:0.8rem;color:var(--glass-green);font-weight:600">${echEnabled === 'true' ? 'chrome' : 'randomized'}</span>
+                                <span style="font-size:0.75rem;color:var(--text-dim)">(ECH开→chrome, 关→randomized)</span>
                             </div>
                             <div style="display:flex;gap:8px">
                                 <button class="btn btn-success" style="flex:1;padding:8px;font-size:0.85rem" onclick="saveEchConfig()">💾 保存 ECH 配置</button>
@@ -3918,7 +3926,7 @@ function dashPage(host, uuid, proxyip, subpass, subdomain, converter, env, clien
             document.getElementById('echDetail').style.display = on ? '' : 'none';
             document.getElementById('echLabel').textContent = on ? '已启用' : '已关闭';
             const fpEl = document.getElementById('fpDisplay');
-            if (fpEl) fpEl.textContent = on ? 'firefox' : 'randomized';
+            if (fpEl) fpEl.textContent = on ? 'chrome' : 'randomized';
         }
         function saveEchConfig() {
             const data = {
@@ -3943,7 +3951,7 @@ function dashPage(host, uuid, proxyip, subpass, subdomain, converter, env, clien
             search.set('sni', host);
             search.set('alpn', 'h3');
             const _echOn = document.getElementById('echSwitch')?.checked;
-            search.set('fp', _echOn ? 'firefox' : 'randomized');
+            search.set('fp', _echOn ? 'chrome' : 'randomized');
             search.set('allowInsecure', '0');
             search.set('type', 'ws');
             search.set('host', host);
